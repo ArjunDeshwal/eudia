@@ -5,3 +5,4 @@ pinecone
 google.generativeai
 streamlit
 langchain_text_splitters
+doc_graph

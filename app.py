@@ -117,50 +117,91 @@ def process_and_embed(ocr_text, summary_text, uploaded_file_name):
     index.upsert(vectors=vectors)
     return index
 
-def get_answer_from_model(query, index):
-    """Retrieves context from Pinecone and generates an answer."""
-    # Retrieve relevant chunks
+def get_answer_from_model(query, index, chat_history, memory_summary):
+    """Retrieves context, combines with memory, and generates an answer."""
+    # Retrieve relevant chunks from the document
     qv = vo.embed([query], model="voyage-law-2", input_type="query").embeddings[0]
-    res = index.query(vector=qv, top_k=4, include_metadata=True)
+    res = index.query(vector=qv, top_k=3, include_metadata=True) # Retrieve fewer chunks to leave space for history
     matches = res.get("matches", [])
     
-    # Fetch summary
+    # Fetch document summary
     summary_res = index.fetch(ids=["summary-0"])
     summary_vec = summary_res.vectors.get("summary-0")
 
-    # Build context
-    context_parts = []
+    # Build Document Context
+    doc_context_parts = []
     references = set()
     if summary_vec and summary_vec.metadata:
-        context_parts.append(f"Document Summary:\n{summary_vec.metadata['text']}")
+        doc_context_parts.append(f"Document Summary:\n{summary_vec.metadata['text']}")
         references.add("summary-0")
     
     if matches:
-        context_parts.append("\nRelevant Chunks:")
+        doc_context_parts.append("\nRelevant Chunks:")
         for m in matches:
             if m.id != 'summary-0' and m.metadata and 'text' in m.metadata:
-                context_parts.append(m.metadata['text'])
+                doc_context_parts.append(m.metadata['text'])
                 references.add(m.id)
+    
+    doc_context = "\n---\n".join(doc_context_parts)
 
-    if len(context_parts) < 2:
-        return "Insufficient context to answer.", []
+    # Build Conversation History Context
+    history_str = "\n".join([f"{m['role']}: {m['content']}" for m in chat_history])
 
-    context = "\n---\n".join(context_parts)
     prompt = f"""
-You are a helpful assistant. Answer the user's question based ONLY on the context provided below.
-The context includes a 'Document Summary' and 'Relevant Chunks'.
+You are a helpful AI assistant. Your task is to answer the user's question based on two sources of information:
+1. The Document Context, which contains a summary and relevant chunks from a document.
+2. The Conversation History, which provides context on the ongoing chat.
 
-- Use the summary for general questions and the chunks for specific details.
-- If the answer is not in the context, state "I cannot answer based on the provided context."
+### Document Context
+{doc_context if doc_context_parts else "No document context available."}
 
-Context:
-{context}
+### Conversation History
+**Summary of earlier conversation:**
+{memory_summary if memory_summary else "No prior conversation summary."}
 
-Question:
+**Recent messages:**
+{history_str if history_str else "This is the first message."}
+
+### Instructions
+- **Prioritize Document Context:** Base your answers primarily on the Document Context.
+- **Use Conversation History for Context:** Use the history to understand follow-up questions (e.g., "what about the second one?").
+- **Cite Sources:** When you use information from the Document Context, cite the source ID (e.g., `[chunk-3]`, `[summary-0]`).
+- **Be Concise:** Keep your answers to the point.
+- **If Unsure:** If the answer cannot be found in the document context, state that clearly.
+
+### User's Current Question
 {query}
 """
     response = gmodel.generate_content(prompt)
     return response.text.strip(), sorted(list(references))
+
+
+@st.cache_data(show_spinner=False)
+def summarize_messages(_messages_to_summarize, _existing_summary):
+    """Summarizes a list of messages to condense the history."""
+    if not _messages_to_summarize:
+        return _existing_summary
+
+    messages_str = "\n".join([f"{m['role']}: {m['content']}" for m in _messages_to_summarize])
+    
+    prompt = f"""
+You are a conversation summarizer. Your task is to create a concise summary of the provided conversation.
+If there is an existing summary, integrate the new conversation turns into it, creating a new, cohesive summary.
+
+Existing Summary:
+{_existing_summary if _existing_summary else "None"}
+
+New Conversation Turns:
+{messages_str}
+
+Please provide the new, integrated summary:
+"""
+    try:
+        summary_response = gmodel.generate_content(prompt)
+        return summary_response.text.strip()
+    except Exception as e:
+        st.warning(f"Could not summarize messages: {e}")
+        return _existing_summary
 
 # --- 3. STREAMLIT UI ---
 
@@ -171,6 +212,8 @@ if "document_processed" not in st.session_state:
     st.session_state.document_processed = False
 if "summary" not in st.session_state:
     st.session_state.summary = ""
+if "memory_summary" not in st.session_state:
+    st.session_state.memory_summary = ""
 
 # Sidebar for file upload
 with st.sidebar:
@@ -191,8 +234,10 @@ with st.sidebar:
                     
                     process_and_embed(ocr_text, summary, uploaded_file.name)
                     
+                    # Reset chat and memory for the new document
                     st.session_state.document_processed = True
                     st.session_state.messages = [] 
+                    st.session_state.memory_summary = ""
                     st.success("Document is ready for chat!")
                     st.rerun()
 
@@ -200,7 +245,7 @@ with st.sidebar:
 if not st.session_state.document_processed:
     st.info("Please upload and process a PDF document to begin chatting.")
 else:
-    # Display Summary
+    # Display Summary and Memory
     st.header("2. Document Summary")
     with st.expander("Click to view the document summary", expanded=True):
         st.markdown(st.session_state.summary)
@@ -212,6 +257,8 @@ else:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    MEMORY_WINDOW_SIZE = 10 # 5 pairs of user/assistant messages
+
     if prompt := st.chat_input("Ask a question about the document..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -220,8 +267,28 @@ else:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 index = get_pinecone_index()
-                answer, refs = get_answer_from_model(prompt, index)
+                answer, refs = get_answer_from_model(
+                    prompt, 
+                    index,
+                    chat_history=st.session_state.messages[:-1], # Pass history BEFORE the current prompt
+                    memory_summary=st.session_state.get("memory_summary", "")
+                )
                 response_with_refs = f"{answer}\n\n*References: `{', '.join(refs)}`*" if refs else answer
                 st.markdown(response_with_refs)
         
         st.session_state.messages.append({"role": "assistant", "content": response_with_refs})
+
+        # --- Memory Management ---
+        if len(st.session_state.messages) > MEMORY_WINDOW_SIZE:
+            messages_to_prune = st.session_state.messages[:-MEMORY_WINDOW_SIZE]
+            
+            current_summary = st.session_state.get("memory_summary", "")
+            new_summary = summarize_messages(messages_to_prune, current_summary)
+            
+            st.session_state.memory_summary = new_summary
+            st.session_state.messages = st.session_state.messages[-MEMORY_WINDOW_SIZE:]
+            
+            # Force a rerun to update the memory summary display in the sidebar
+            st.rerun()
+        else:
+            st.rerun()
