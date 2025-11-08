@@ -5,4 +5,9 @@ pinecone
 google.generativeai
 streamlit
 langchain_text_splitters
-doc_graph
+llama-index
+llama-index-vector-stores-pinecone
+llama-index-embeddings-voyageai
+llama-index-llms-google-genai
+pymupdf
+pillow

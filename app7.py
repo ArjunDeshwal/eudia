@@ -4,6 +4,9 @@ import os
 import re
 import sys
 import json
+import io
+import html
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -16,6 +19,21 @@ from pinecone import Pinecone, ServerlessSpec
 import pinecone
 import google.generativeai as genai
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from llama_index.core import VectorStoreIndex
+from llama_index.vector_stores.pinecone import PineconeVectorStore
+from llama_index.core import Settings
+from llama_index.embeddings.voyageai import VoyageEmbedding
+from llama_index.llms.google_genai import GoogleGenAI
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:  # pragma: no cover - optional dependency
+    fitz = None
+
+try:
+    from PIL import Image, ImageDraw
+except ImportError:  # pragma: no cover - optional dependency
+    Image = ImageDraw = None
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -24,8 +42,8 @@ if str(ROOT_DIR) not in sys.path:
 from doc_graph import build_document_graph
 
 # --- 1. INITIALIZATION ---
-st.set_page_config(page_title="DocuChat", layout="wide")
-st.title("📄 DocuChat: Chat with your Documents")
+st.set_page_config(page_title="Eudexa", layout="wide")
+st.title("🤖 Eudexa: Chat and Act with your Documents")
 
 # Load environment variables
 load_dotenv()
@@ -51,6 +69,10 @@ def configure_clients():
 
 mistral_client, gmodel, vo, pc = configure_clients()
 
+embed_model = VoyageEmbedding(model_name="voyage-law-2", voyage_api_key=os.environ["VOYAGE_API_KEY"])
+Settings.embed_model = embed_model
+Settings.llm = GoogleGenAI(model="gemini-2.5-flash", api_key=os.environ["GEMINI_API_KEY"])
+
 INDEX_NAME = "streamlit-doc-chat-demo"
 N8N_WEBHOOK_URL = os.getenv(
     "N8N_WEBHOOK_URL",
@@ -74,6 +96,61 @@ def get_ocr_text(_pdf_bytes):
     if not ocr_text.strip() and getattr(ocr_response, "text", None):
         ocr_text = ocr_response.text
     return ocr_text
+
+@st.cache_data(show_spinner=False)
+def get_ocr_text_with_images(_pdf_bytes):
+    """Performs OCR on PDF bytes and returns the extracted text along with images and highlighted regions."""
+    base64_pdf = base64.b64encode(_pdf_bytes).decode('utf-8')
+    ocr_response = mistral_client.ocr.process(
+        model="mistral-ocr-latest",
+        document={"type": "document_url", "document_url": f"data:application/pdf;base64,{base64_pdf}"}
+    )
+    
+    ocr_text = ""
+    images_data = []
+    highlights_data = []
+    pages_data = []
+    
+    for page_idx, page in enumerate(ocr_response.pages):
+        page_markdown = getattr(page, "markdown", "") or ""
+        if page_markdown:
+            ocr_text += page_markdown + "\n\n"
+        pages_data.append({
+            "page_number": page_idx + 1,
+            "text": page_markdown
+        })
+        
+        # Extract images if available in the OCR response
+        if hasattr(page, 'images') and page.images:
+            for img_idx, img_data in enumerate(page.images):
+                # Store image data with reference to the page and position
+                images_data.append({
+                    'page_number': page_idx + 1,
+                    'image_index': img_idx,
+                    'image_data': img_data,
+                    'text_association': getattr(page, "markdown", "")[:200]  # First 200 chars to associate with text
+                })
+        
+        # Extract highlighted regions if available in the OCR response
+        if hasattr(page, 'highlights') and page.highlights:
+            for highlight_idx, highlight in enumerate(page.highlights):
+                highlights_data.append({
+                    'page_number': page_idx + 1,
+                    'highlight_index': highlight_idx,
+                    'highlight_text': highlight.text,
+                    'coordinates': highlight.bbox if hasattr(highlight, 'bbox') else None,
+                    'text_association': getattr(page, "markdown", "")[:200]
+                })
+    
+    if not ocr_text.strip() and getattr(ocr_response, "text", None):
+        ocr_text = ocr_response.text
+    
+    return {
+        'text': ocr_text,
+        'pages': pages_data,
+        'images': images_data,
+        'highlights': highlights_data
+    }
 
 @st.cache_data(show_spinner=False)
 def generate_summary(_ocr_text):
@@ -102,124 +179,19 @@ def get_pinecone_index():
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
-    return pc.Index(INDEX_NAME)
+    pinecone_index = pc.Index(INDEX_NAME)
+    vector_store = PineconeVectorStore(pinecone_index=pinecone_index)
+    return vector_store, pinecone_index
 
-def process_and_embed(ocr_text, summary_text, uploaded_file_name):
-    """Chunks text, embeds, and upserts to Pinecone. Returns index, chunks, embeddings."""
-    index = get_pinecone_index()
-    try:
-        index.delete(delete_all=True)  # Clear index for the new document
-    except pinecone.exceptions.NotFoundException:
-        # This can happen if the default namespace doesn't exist yet on a new index.
-        pass
-
-    # Chunk the text
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = text_splitter.split_text(ocr_text)
-
-    # Embed chunks and summary
-    chunk_embeddings = vo.embed(chunks, model="voyage-law-2", input_type="document").embeddings
-    summary_embedding = vo.embed([summary_text], model="voyage-law-2", input_type="document").embeddings[0]
-
-    # Upsert vectors
-    vectors = [{
-        "id": f"chunk-{i}", "values": chunk_embeddings[i],
-        "metadata": {"text": chunks[i], "source": uploaded_file_name}
-    } for i in range(len(chunks))]
-    vectors.append({
-        "id": "summary-0", "values": summary_embedding,
-        "metadata": {"text": summary_text, "source": uploaded_file_name}
-    })
-
-    index.upsert(vectors=vectors)
-    return index, chunks, chunk_embeddings
-
-def get_answer_from_model(query, index, chat_history, memory_summary, negotiation_result):
+def get_answer_from_model(query, vector_store, chat_history, memory_summary, negotiation_result):
     """Retrieves context, combines with memory and negotiation results, and generates an answer."""
-    # Retrieve relevant chunks from the document
-    qv = vo.embed([query], model="voyage-law-2", input_type="query").embeddings[0]
-    res = index.query(vector=qv, top_k=3, include_metadata=True) # Retrieve fewer chunks to leave space for history
-    matches = res.get("matches", [])
-    
-    # Fetch document summary
-    summary_res = index.fetch(ids=["summary-0"])
-    summary_vec = summary_res.vectors.get("summary-0")
+    index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
+    chat_engine = index.as_chat_engine(
+        chat_mode="context",
+    )
+    response = chat_engine.chat(query)
 
-    # Build Document Context
-    doc_context_parts = []
-    references = set()
-    if summary_vec and summary_vec.metadata:
-        doc_context_parts.append(f"Document Summary:\n{summary_vec.metadata['text']}")
-        references.add("summary-0")
-    
-    if matches:
-        doc_context_parts.append("\nRelevant Chunks:")
-        for m in matches:
-            if m.id != 'summary-0' and m.metadata and 'text' in m.metadata:
-                doc_context_parts.append(m.metadata['text'])
-                references.add(m.id)
-    
-    doc_context = "\n---\n".join(doc_context_parts)
-
-    # Build Conversation History Context
-    history_str = "\n".join([f"{m['role']}: {m['content']}" for m in chat_history])
-
-    # Build Negotiation Context
-    negotiation_context = ""
-    if negotiation_result:
-        try:
-            issues = negotiation_result.get("issues", [])
-            overall_summary = negotiation_result.get("overall_summary", "Not available.")
-            
-            formatted_issues = []
-            for i, issue in enumerate(issues, 1):
-                formatted_issues.append(
-                    f"  - Issue {i}: {issue.get('topic', 'N/A')}\n"
-                    f"    - Risk: {issue.get('risk', 'N/A')}\n"
-                    f"    - Suggested Counter: {issue.get('suggested_counter', 'N/A')}"
-                )
-            
-            negotiation_context = f"""
-### Negotiation Analysis Context
-A negotiation analysis was performed. If the user asks about negotiation points, risks, or differences between document versions, use this context.
-
-**Overall Summary:** {overall_summary}
-
-**Key Issues Identified:**
-{chr(10).join(formatted_issues) if formatted_issues else "No specific issues were identified."}
-"""
-        except Exception:
-            negotiation_context = f"""
-### Negotiation Analysis Context
-{json.dumps(negotiation_result, indent=2)}
-"""
-
-    prompt = f"""
-You are a helpful AI assistant. Your task is to answer the user's question based on the sources of information provided below. The sources are prioritized: Negotiation Context is highest, then Document Context, then Conversation History.
-
-{negotiation_context if negotiation_context else ""}
-
-### Document Context
-{doc_context if doc_context_parts else "No document context available."}
-
-### Conversation History
-**Summary of earlier conversation:**
-{memory_summary if memory_summary else "No prior conversation summary."}
-
-**Recent messages:**
-{history_str if history_str else "This is the first message."}
-
-### Instructions
-- **Prioritize the most relevant context.** If the user asks about negotiation, use the Negotiation Analysis. If they ask about the uploaded document, use the Document Context. Use Conversation History for follow-ups.
-- **Cite Sources:** When you use information from the Document Context, cite the source ID (e.g., `[chunk-3]`, `[summary-0]`). You do not need to cite the negotiation or conversation history.
-- **Be Concise:** Keep your answers to the point.
-- **If Unsure:** If the answer cannot be found in the provided context, state that clearly.
-
-### User's Current Question
-{query}
-"""
-    response = gmodel.generate_content(prompt)
-    return response.text.strip(), sorted(list(references))
+    return response.response, response.source_nodes
 
 
 @st.cache_data(show_spinner=False)
@@ -305,7 +277,9 @@ Return a single JSON object containing these sections:
       "risk_level": "low / medium / high",
       "urgency_level": "urgent / soon / normal",
       "confidence": 0.0,
-      "recommended_action": "create_calendar_event / send_email / legal_review / store_only"
+      "recommended_action": "create_calendar_event / send_email / legal_review / store_only",
+      "source_chunk_id": 0,
+      "raw_text": ""
     }
   ],
 
@@ -319,7 +293,9 @@ Return a single JSON object containing these sections:
       "payment_type": "advance / milestone / recurring / final",
       "penalty_if_delayed": "",
       "risk_level": "",
-      "recommended_action": ""
+      "recommended_action": "",
+      "source_chunk_id": 0,
+      "raw_text": ""
     }
   ],
 
@@ -328,7 +304,9 @@ Return a single JSON object containing these sections:
       "clause_text": "",
       "reason_for_risk": "",
       "risk_score": 0.0,
-      "recommended_action": ""
+      "recommended_action": "",
+      "source_chunk_id": 0,
+      "raw_text": ""
     }
   ],
 
@@ -338,7 +316,9 @@ Return a single JSON object containing these sections:
       "responsible_party": "",
       "urgency_level": "",
       "trigger_date": "",
-      "recommended_workflow": "email_alert / calendar_event / report_generation / escalation"
+      "recommended_workflow": "email_alert / calendar_event / report_generation / escalation",
+      "source_chunk_id": 0,
+      "raw_text": ""
     }
   ],
 
@@ -355,6 +335,8 @@ Return a single JSON object containing these sections:
 
 - Treat any sentence with "shall", "must", "agree to", "responsible for", "liable for" as an obligation.
 - Identify dates, time frames, or phrases like "within 7 days", "by end of month" as deadlines.
+- For each extracted item, you MUST include the `source_chunk_id` from the input chunk it came from.
+- You MUST also include the `raw_text`, which is the exact, verbatim sentence or phrase from the source chunk that justifies the extraction.
 - Label urgency:
     - `urgent` → due within 7 days or high risk
     - `soon` → due within 30 days
@@ -428,6 +410,147 @@ def safe_json_parse(raw_text: str) -> Any:
         return {"raw": raw_text}
 
 
+def get_chunk_metadata(chunk_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if chunk_id is None:
+        return None
+    chunk_meta = st.session_state.get("chunk_metadata") or []
+    if 0 <= chunk_id < len(chunk_meta):
+        return chunk_meta[chunk_id]
+    return None
+
+
+def _normalize_snippet(snippet: Optional[str]) -> str:
+    if not snippet:
+        return ""
+    return re.sub(r"\s+", " ", snippet).strip()
+
+
+def _build_search_candidates(primary: Optional[str], secondary: Optional[str]) -> List[str]:
+    seen = set()
+    candidates: List[str] = []
+    for text in (primary, secondary):
+        normalized = _normalize_snippet(text)
+        if not normalized:
+            continue
+        for variant in (normalized, normalized[:220], normalized[:140]):
+            if not variant or variant in seen:
+                continue
+            seen.add(variant)
+            candidates.append(variant)
+    return candidates
+
+
+def _draw_highlight_from_pdf(source_file: str, page_number: int, search_text: str) -> Optional[str]:
+    if not fitz or Image is None or ImageDraw is None:
+        return None
+    if not search_text:
+        return None
+    pdf_sources = st.session_state.get("pdf_sources") or {}
+    pdf_bytes = pdf_sources.get(source_file)
+    if not pdf_bytes:
+        return None
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return None
+
+    try:
+        page = document[page_number - 1]
+    except Exception:
+        document.close()
+        return None
+
+    try:
+        rects = page.search_for(search_text, hit_max=16)
+    except Exception:
+        rects = []
+
+    if not rects:
+        document.close()
+        return None
+
+    zoom = 2.0
+    matrix = fitz.Matrix(zoom, zoom)
+    try:
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+    except Exception:
+        document.close()
+        return None
+
+    mode = "RGB" if pix.n < 4 else "RGBA"
+    img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+    if mode == "RGBA":
+        img = img.convert("RGB")
+    draw = ImageDraw.Draw(img, "RGBA")
+    pixel_rects = []
+    for rect in rects:
+        px_rect = [
+            rect.x0 * zoom,
+            rect.y0 * zoom,
+            rect.x1 * zoom,
+            rect.y1 * zoom,
+        ]
+        pixel_rects.append(px_rect)
+        draw.rectangle(
+            px_rect,
+            outline=(255, 0, 0, 255),
+            fill=(255, 255, 0, 80),
+            width=4,
+        )
+
+    document.close()
+
+    if pixel_rects:
+        min_x = max(0, min(r[0] for r in pixel_rects) - 20)
+        min_y = max(0, min(r[1] for r in pixel_rects) - 20)
+        max_x = min(img.width, max(r[2] for r in pixel_rects) + 20)
+        max_y = min(img.height, max(r[3] for r in pixel_rects) + 20)
+        img = img.crop((int(min_x), int(min_y), int(max_x), int(max_y)))
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def get_highlight_snapshot(source_file: Optional[str], page_number: Optional[int], primary_text: Optional[str], fallback_text: Optional[str]) -> Optional[str]:
+    if not source_file or not page_number:
+        return None
+    candidates = _build_search_candidates(primary_text, fallback_text)
+    if not candidates:
+        return None
+    cache = st.session_state.setdefault("highlight_cache", {})
+    for candidate in candidates:
+        digest = hashlib.sha1(candidate.encode("utf-8", errors="ignore")).hexdigest()
+        cache_key = f"{source_file}|{page_number}|{digest}"
+        if cache_key in cache:
+            return cache[cache_key]
+        image_b64 = _draw_highlight_from_pdf(source_file, page_number, candidate)
+        if image_b64:
+            cache[cache_key] = image_b64
+            return image_b64
+    return None
+
+
+def highlight_text_snippet(full_text: Optional[str], snippet: Optional[str]) -> str:
+    safe_text = html.escape(full_text or "")
+    snippet_normalized = _normalize_snippet(snippet)
+    if not full_text or not snippet_normalized:
+        return safe_text
+    pattern = re.escape(snippet_normalized).replace(r"\ ", r"\s+")
+    try:
+        match = re.search(pattern, full_text, flags=re.IGNORECASE)
+    except re.error:
+        match = None
+    if not match:
+        return safe_text
+    start_pos, end_pos = match.span()
+    return (
+        f"{html.escape(full_text[:start_pos])}"
+        f"<mark>{html.escape(full_text[start_pos:end_pos])}</mark>"
+        f"{html.escape(full_text[end_pos:])}"
+    )
+
+
 @st.cache_data(show_spinner=False)
 def generate_structured_doc_json_cached(doc_text: str) -> Dict[str, Any]:
     if not doc_text:
@@ -465,6 +588,7 @@ def ensure_structured_doc_json(force: bool = False) -> Dict[str, Any]:
 def get_relevant_chunks_from_session(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     chunk_texts = st.session_state.get("chunks") or []
     chunk_embs = st.session_state.get("chunk_embeddings") or []
+    chunk_meta = st.session_state.get("chunk_metadata") or []
     if not chunk_texts or not chunk_embs:
         return []
     q_emb = vo.embed([query], model="voyage-law-2", input_type="query").embeddings[0]
@@ -473,11 +597,16 @@ def get_relevant_chunks_from_session(query: str, top_k: int = 5) -> List[Dict[st
         score = cosine_similarity_local(q_emb, emb)
         scored.append((score, idx))
     top = sorted(scored, reverse=True)[: max(1, top_k)]
-    return [
-        {"chunk_id": idx, "score": round(score, 4), "text": chunk_texts[idx]}
-        for score, idx in top
-        if idx < len(chunk_texts)
-    ]
+    enriched = []
+    for score, idx in top:
+        if idx >= len(chunk_texts):
+            continue
+        entry = {"chunk_id": idx, "score": round(score, 4), "text": chunk_texts[idx]}
+        if idx < len(chunk_meta):
+            entry["source_file"] = chunk_meta[idx].get("source_file")
+            entry["page_number"] = chunk_meta[idx].get("page_number")
+        enriched.append(entry)
+    return enriched
 
 
 def record_agent_run(name: str, payload: Any, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -517,13 +646,19 @@ Proposed change:
     return {"change_instruction": change_instruction, "plan": plan}
 
 
-def run_automation_agent(question: str) -> Dict[str, Any]:
+def run_automation_agent_with_citations(question: str) -> Dict[str, Any]:
     relevant_chunks = get_relevant_chunks_from_session(question, top_k=5)
+    # Get the document images and highlights from session state if available
+    doc_images = st.session_state.get("doc_images", [])
+    doc_highlights = st.session_state.get("doc_highlights", [])
+    
     input_payload = {
         "doc_title": st.session_state.get("doc_title") or "Document",
         "summary": st.session_state.get("summary", ""),
         "question": question,
         "chunks": relevant_chunks,
+        "images": doc_images,
+        "highlights": doc_highlights
     }
     prompt = f"""{AUTOMATION_EXTRACTION_PROMPT}\n\nInput JSON:\n{json.dumps(input_payload, ensure_ascii=False)}"""
     response = gmodel.generate_content(prompt)
@@ -531,6 +666,9 @@ def run_automation_agent(question: str) -> Dict[str, Any]:
     result = {"question": question, "input": input_payload, "extracted": extracted}
     st.session_state.last_automation_payload = extracted
     return result
+
+def run_automation_agent(question: str) -> Dict[str, Any]:
+    return run_automation_agent_with_citations(question)
 
 
 def run_negotiation_agent(vendor_text: str, client_text: str, title: str) -> Dict[str, Any]:
@@ -656,6 +794,8 @@ if "chunks" not in st.session_state:
     st.session_state.chunks = []
 if "chunk_embeddings" not in st.session_state:
     st.session_state.chunk_embeddings = []
+if "chunk_metadata" not in st.session_state:
+    st.session_state.chunk_metadata = []
 if "doc_title" not in st.session_state:
     st.session_state.doc_title = ""
 if "last_automation_payload" not in st.session_state:
@@ -668,6 +808,14 @@ if "negotiation_output" not in st.session_state:
     st.session_state.negotiation_output = None
 if "memory_summary" not in st.session_state:
     st.session_state.memory_summary = ""
+if "doc_images" not in st.session_state:
+    st.session_state.doc_images = []
+if "doc_highlights" not in st.session_state:
+    st.session_state.doc_highlights = []
+if "pdf_sources" not in st.session_state:
+    st.session_state.pdf_sources = {}
+if "highlight_cache" not in st.session_state:
+    st.session_state.highlight_cache = {}
 
 
 def reset_agent_state() -> None:
@@ -680,47 +828,141 @@ def reset_agent_state() -> None:
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("1. Upload Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    st.header("Upload Documents")
+    uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
 
-    if uploaded_file is not None:
-        if st.button("Process Document"):
-            with st.spinner("Processing document... This may take a few moments."):
-                pdf_bytes = uploaded_file.getvalue()
-                ocr_text = get_ocr_text(pdf_bytes)
-                if not ocr_text.strip():
-                    st.error("OCR failed to extract text. Please try another document.")
-                else:
-                    summary = generate_summary(ocr_text)
-                    st.session_state.summary = summary
-                    _, chunks, chunk_embeddings = process_and_embed(ocr_text, summary, uploaded_file.name)
+    if uploaded_files:
+        if st.button("Process Documents"):
+            with st.spinner("Processing documents... This may take a few moments."):
+                # 1. Clear old data from Pinecone
+                vector_store, pinecone_index = get_pinecone_index()
+                try:
+                    pinecone_index.delete(delete_all=True)
+                except pinecone.exceptions.NotFoundException:
+                    pass
 
-                    st.session_state.ocr_text = ocr_text
-                    st.session_state.doc_title = uploaded_file.name
-                    st.session_state.chunks = chunks
-                    st.session_state.chunk_embeddings = chunk_embeddings
-                    reset_agent_state()
-                    st.session_state.document_processed = True
-                    st.session_state.messages = []
-                    st.success("Document is ready for chat!")
-                    st.rerun()
+                # 2. Process each file
+                all_ocr_text = []
+                all_chunks = []
+                all_vectors = []
+                all_chunk_metadata = []
+                doc_titles = []
+                all_images = []
+                all_highlights = []
+                pdf_sources = {}
+
+                for uploaded_file in uploaded_files:
+                    pdf_bytes = uploaded_file.getvalue()
+                    file_name = uploaded_file.name
+                    doc_titles.append(file_name)
+                    pdf_sources[file_name] = pdf_bytes
+
+                    # Get OCR data with images and highlights
+                    ocr_result = get_ocr_text_with_images(pdf_bytes)
+                    ocr_text = ocr_result['text']
+                    
+                    if not ocr_text.strip():
+                        st.warning(f"OCR failed to extract text from {file_name}. Skipping this file.")
+                        continue
+                    
+                    all_ocr_text.append(ocr_text)
+
+                    # Store images and highlights
+                    all_images.extend([{
+                        **img, 
+                        'source_file': file_name
+                    } for img in ocr_result['images']])
+                    all_highlights.extend([{
+                        **hl, 
+                        'source_file': file_name
+                    } for hl in ocr_result['highlights']])
+
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+                    page_chunks_source = ocr_result.get('pages') or []
+                    if not page_chunks_source:
+                        page_chunks_source = [{"page_number": 1, "text": ocr_text}]
+
+                    doc_chunks = []
+                    doc_chunk_meta = []
+                    for fallback_idx, page_data in enumerate(page_chunks_source):
+                        page_text = page_data.get("text") or ""
+                        if not page_text.strip():
+                            continue
+                        page_number = page_data.get("page_number") or (fallback_idx + 1)
+                        page_chunks = text_splitter.split_text(page_text)
+                        for chunk_text in page_chunks:
+                            doc_chunks.append(chunk_text)
+                            doc_chunk_meta.append({
+                                "text": chunk_text,
+                                "source_file": file_name,
+                                "page_number": page_number,
+                                "page_text": page_text
+                            })
+
+                    if not doc_chunks:
+                        continue
+
+                    chunk_embeddings = vo.embed(doc_chunks, model="voyage-law-2", input_type="document").embeddings
+
+                    for idx, chunk_text in enumerate(doc_chunks):
+                        chunk_id = len(all_chunks)
+                        all_chunks.append(chunk_text)
+                        chunk_meta = doc_chunk_meta[idx]
+                        chunk_meta["chunk_id"] = chunk_id
+                        all_chunk_metadata.append(chunk_meta)
+                        all_vectors.append({
+                            "id": f"{file_name}-chunk-{chunk_id}",
+                            "values": chunk_embeddings[idx],
+                            "metadata": {"text": chunk_text, "source": file_name}
+                        })
+
+                if not all_ocr_text:
+                    st.error("Could not extract text from any of the documents.")
+                    st.stop()
+
+                # 3. Create a combined summary
+                combined_text = "\n\n--- NEW DOCUMENT ---\n\n".join(all_ocr_text)
+                summary = generate_summary(combined_text)
+                
+                # 4. Embed and add summary vector
+                summary_embedding = vo.embed([summary], model="voyage-law-2", input_type="document").embeddings[0]
+                all_vectors.append({
+                    "id": "summary-0", "values": summary_embedding,
+                    "metadata": {"text": summary, "source": "Global Summary"}
+                })
+
+                # 5. Upsert all vectors to Pinecone
+                pinecone_index.upsert(vectors=all_vectors)
+
+                # 6. Update session state
+                st.session_state.summary = summary
+                st.session_state.ocr_text = combined_text
+                st.session_state.doc_title = ", ".join(doc_titles)
+                
+                all_chunk_embeddings = [vec['values'] for vec in all_vectors if vec['id'] != 'summary-0']
+                st.session_state.chunk_embeddings = all_chunk_embeddings
+                st.session_state.chunks = all_chunks
+                st.session_state.chunk_metadata = all_chunk_metadata
+                st.session_state.doc_images = all_images
+                st.session_state.doc_highlights = all_highlights
+                st.session_state.pdf_sources = pdf_sources
+                st.session_state.highlight_cache = {}
+
+                # Reset state and rerun
+                reset_agent_state()
+                st.session_state.document_processed = True
+                st.session_state.messages = []
+                st.success(f"Processed {len(doc_titles)} documents. Ready for chat!")
+                st.rerun()
 
     st.divider()
 
     if not st.session_state.document_processed:
         st.info("Process a document to see available tools.")
     else:
-        st.header("2. Views")
-        
-        # Navigation
-        if st.session_state.view != "Chat":
-            if st.button("Switch to Chat View", use_container_width=True):
-                st.session_state.view = "Chat"
-                st.rerun()
-
+        st.header("Views")
         view_options = ["Chat", "Document Summary", "Knowledge Graph", "What-If Analysis", "Automation", "Negotiation Analysis"]
         
-        # Use a radio button for view selection, which feels more like navigation
         st.session_state.view = st.radio(
             "Select a View",
             view_options,
@@ -735,7 +977,7 @@ if not st.session_state.document_processed:
 else:
     # --- CHAT VIEW ---
     if st.session_state.view == "Chat":
-        st.header("Chat with the Document")
+        st.header('Chat')
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
@@ -749,18 +991,25 @@ else:
 
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    index = get_pinecone_index()
-                    answer, refs = get_answer_from_model(
+                    vector_store, _ = get_pinecone_index()
+                    answer, source_nodes = get_answer_from_model(
                         prompt,
-                        index,
+                        vector_store,
                         chat_history=st.session_state.messages[:-1],
                         memory_summary=st.session_state.get("memory_summary", ""),
                         negotiation_result=st.session_state.get("negotiation_output"),
                     )
-                    response_with_refs = f"{answer}\n\n*References: `{', '.join(refs)}`*" if refs else answer
-                    st.markdown(response_with_refs)
+                    st.markdown(answer)
+
+                    if source_nodes:
+                        with st.expander("Sources"):
+                            for i, node in enumerate(source_nodes):
+                                st.markdown(f"**Source {i+1} (Score: {node.score:.2f})**")
+                                st.markdown(f"> From: {node.metadata.get('source', 'N/A')}")
+                                st.markdown("---")
+                                st.markdown(node.get_content())
             
-            st.session_state.messages.append({"role": "assistant", "content": response_with_refs})
+            st.session_state.messages.append({"role": "assistant", "content": answer})
 
             if len(st.session_state.messages) > MEMORY_WINDOW_SIZE:
                 messages_to_prune = st.session_state.messages[:-MEMORY_WINDOW_SIZE]
@@ -865,6 +1114,84 @@ else:
         if automation_run:
             st.subheader("Latest Extracted JSON")
             st.json(automation_run.get("result", {}))
+
+            # --- NEW CITATIONS SECTION ---
+            st.subheader("Citations")
+            extracted_data = automation_run.get("result", {}).get("extracted", {})
+            if not extracted_data:
+                st.info("No citation data available.")
+            else:
+                citation_items: List[Dict[str, Any]] = []
+                section_keys = ["obligations", "payments", "high_risk_clauses", "immediate_actions"]
+                for key in section_keys:
+                    section_items = extracted_data.get(key) or []
+                    for entry in section_items:
+                        if not isinstance(entry, dict):
+                            continue
+                        enriched = dict(entry)
+                        enriched["type"] = key.replace("_", " ").title()
+                        citation_items.append(enriched)
+
+                if not citation_items:
+                    st.info("No items with source information were extracted.")
+                else:
+                    for idx, item in enumerate(citation_items, start=1):
+                        chunk_id = item.get("source_chunk_id")
+                        raw_text = item.get("raw_text")
+                        chunk_meta = get_chunk_metadata(chunk_id)
+
+                        with st.container(border=True):
+                            st.markdown(f"**{item.get('type', 'Item')} · #{idx}**")
+
+                            description = (
+                                item.get("obligation_description")
+                                or item.get("clause_text")
+                                or item.get("task_description")
+                                or item.get("payment_type")
+                            )
+                            if description:
+                                st.markdown(f"**Detail:** {description}")
+
+                            if chunk_meta:
+                                st.caption(f"{chunk_meta.get('source_file', 'Document')} · Page {chunk_meta.get('page_number', '?')} · Chunk {chunk_id}")
+                            elif chunk_id is not None:
+                                st.caption(f"Source chunk {chunk_id} was not found in the current session.")
+                            else:
+                                st.caption("No chunk reference was returned for this item.")
+
+                            context_text = chunk_meta.get("text") if chunk_meta else raw_text
+                            highlighted_context = highlight_text_snippet(context_text or "", raw_text or context_text)
+                            st.markdown("**Context Snippet:**", help="The matching portion of the source chunk with highlights.")
+                            st.markdown(f"<div class='chunk-snippet'>{highlighted_context}</div>", unsafe_allow_html=True)
+
+                            if raw_text:
+                                st.markdown("**Verbatim Evidence:**")
+                                st.code(raw_text)
+
+                            image_b64 = get_highlight_snapshot(
+                                chunk_meta.get("source_file") if chunk_meta else None,
+                                chunk_meta.get("page_number") if chunk_meta else None,
+                                raw_text,
+                                context_text,
+                            )
+
+                            if image_b64:
+                                st.markdown("**Document Clip:**")
+                                st.image(
+                                    f"data:image/png;base64,{image_b64}",
+                                    caption=f"{chunk_meta.get('source_file', 'Document')} · Page {chunk_meta.get('page_number', '?')}",
+                                    use_column_width=True,
+                                )
+                            elif fitz is None or Image is None or ImageDraw is None:
+                                st.info("Install PyMuPDF and Pillow to visualize highlighted document snippets.")
+                            else:
+                                st.info("Could not locate this text on the PDF page. It may be part of an image-only scan.")
+
+                            if chunk_meta:
+                                with st.expander("Full Source Chunk"):
+                                    st.markdown(chunk_meta.get("text", ""))
+                            elif chunk_id is not None:
+                                st.warning(f"Source chunk ID {chunk_id} is out of bounds.")
         else:
             st.info("No automation data has been extracted yet.")
 

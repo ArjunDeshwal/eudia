@@ -24,8 +24,8 @@ if str(ROOT_DIR) not in sys.path:
 from doc_graph import build_document_graph
 
 # --- 1. INITIALIZATION ---
-st.set_page_config(page_title="DocuChat", layout="wide")
-st.title("📄 DocuChat: Chat with your Documents")
+st.set_page_config(page_title="Eudexa", layout="wide")
+st.title("🤖 Eudexa: Chat and Act with your Documents")
 
 # Load environment variables
 load_dotenv()
@@ -104,41 +104,11 @@ def get_pinecone_index():
         )
     return pc.Index(INDEX_NAME)
 
-def process_and_embed(ocr_text, summary_text, uploaded_file_name):
-    """Chunks text, embeds, and upserts to Pinecone. Returns index, chunks, embeddings."""
-    index = get_pinecone_index()
-    try:
-        index.delete(delete_all=True)  # Clear index for the new document
-    except pinecone.exceptions.NotFoundException:
-        # This can happen if the default namespace doesn't exist yet on a new index.
-        pass
-
-    # Chunk the text
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = text_splitter.split_text(ocr_text)
-
-    # Embed chunks and summary
-    chunk_embeddings = vo.embed(chunks, model="voyage-law-2", input_type="document").embeddings
-    summary_embedding = vo.embed([summary_text], model="voyage-law-2", input_type="document").embeddings[0]
-
-    # Upsert vectors
-    vectors = [{
-        "id": f"chunk-{i}", "values": chunk_embeddings[i],
-        "metadata": {"text": chunks[i], "source": uploaded_file_name}
-    } for i in range(len(chunks))]
-    vectors.append({
-        "id": "summary-0", "values": summary_embedding,
-        "metadata": {"text": summary_text, "source": uploaded_file_name}
-    })
-
-    index.upsert(vectors=vectors)
-    return index, chunks, chunk_embeddings
-
 def get_answer_from_model(query, index, chat_history, memory_summary, negotiation_result):
     """Retrieves context, combines with memory and negotiation results, and generates an answer."""
     # Retrieve relevant chunks from the document
     qv = vo.embed([query], model="voyage-law-2", input_type="query").embeddings[0]
-    res = index.query(vector=qv, top_k=3, include_metadata=True) # Retrieve fewer chunks to leave space for history
+    res = index.query(vector=qv, top_k=5, include_metadata=True) # Retrieve more chunks for multi-doc
     matches = res.get("matches", [])
     
     # Fetch document summary
@@ -150,14 +120,15 @@ def get_answer_from_model(query, index, chat_history, memory_summary, negotiatio
     references = set()
     if summary_vec and summary_vec.metadata:
         doc_context_parts.append(f"Document Summary:\n{summary_vec.metadata['text']}")
-        references.add("summary-0")
+        references.add("Global Summary")
     
     if matches:
         doc_context_parts.append("\nRelevant Chunks:")
         for m in matches:
             if m.id != 'summary-0' and m.metadata and 'text' in m.metadata:
-                doc_context_parts.append(m.metadata['text'])
-                references.add(m.id)
+                source = m.metadata.get('source', 'unknown')
+                doc_context_parts.append(f"Source: {source}\n{m.metadata['text']}")
+                references.add(source)
     
     doc_context = "\n---\n".join(doc_context_parts)
 
@@ -211,7 +182,7 @@ You are a helpful AI assistant. Your task is to answer the user's question based
 
 ### Instructions
 - **Prioritize the most relevant context.** If the user asks about negotiation, use the Negotiation Analysis. If they ask about the uploaded document, use the Document Context. Use Conversation History for follow-ups.
-- **Cite Sources:** When you use information from the Document Context, cite the source ID (e.g., `[chunk-3]`, `[summary-0]`). You do not need to cite the negotiation or conversation history.
+- **Cite Sources:** When you use information from the Document Context, cite the source document name (e.g., `[contract.pdf]`, `[Global Summary]`). You do not need to cite the negotiation or conversation history.
 - **Be Concise:** Keep your answers to the point.
 - **If Unsure:** If the answer cannot be found in the provided context, state that clearly.
 
@@ -680,47 +651,93 @@ def reset_agent_state() -> None:
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("1. Upload Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    st.header("Upload Documents")
+    uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
 
-    if uploaded_file is not None:
-        if st.button("Process Document"):
-            with st.spinner("Processing document... This may take a few moments."):
-                pdf_bytes = uploaded_file.getvalue()
-                ocr_text = get_ocr_text(pdf_bytes)
-                if not ocr_text.strip():
-                    st.error("OCR failed to extract text. Please try another document.")
-                else:
-                    summary = generate_summary(ocr_text)
-                    st.session_state.summary = summary
-                    _, chunks, chunk_embeddings = process_and_embed(ocr_text, summary, uploaded_file.name)
+    if uploaded_files:
+        if st.button("Process Documents"):
+            with st.spinner("Processing documents... This may take a few moments."):
+                # 1. Clear old data from Pinecone
+                index = get_pinecone_index()
+                try:
+                    index.delete(delete_all=True)
+                except pinecone.exceptions.NotFoundException:
+                    pass
 
-                    st.session_state.ocr_text = ocr_text
-                    st.session_state.doc_title = uploaded_file.name
-                    st.session_state.chunks = chunks
-                    st.session_state.chunk_embeddings = chunk_embeddings
-                    reset_agent_state()
-                    st.session_state.document_processed = True
-                    st.session_state.messages = []
-                    st.success("Document is ready for chat!")
-                    st.rerun()
+                # 2. Process each file
+                all_ocr_text = []
+                all_chunks = []
+                all_vectors = []
+                doc_titles = []
+
+                for uploaded_file in uploaded_files:
+                    pdf_bytes = uploaded_file.getvalue()
+                    file_name = uploaded_file.name
+                    doc_titles.append(file_name)
+
+                    ocr_text = get_ocr_text(pdf_bytes)
+                    if not ocr_text.strip():
+                        st.warning(f"OCR failed to extract text from {file_name}. Skipping this file.")
+                        continue
+                    
+                    all_ocr_text.append(ocr_text)
+
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+                    chunks = text_splitter.split_text(ocr_text)
+                    
+                    chunk_embeddings = vo.embed(chunks, model="voyage-law-2", input_type="document").embeddings
+                    
+                    vectors = [{
+                        "id": f"{file_name}-chunk-{i}", "values": chunk_embeddings[i],
+                        "metadata": {"text": chunks[i], "source": file_name}
+                    } for i in range(len(chunks))]
+                    
+                    # Add to combined lists
+                    all_chunks.extend(chunks)
+                    all_vectors.extend(vectors)
+
+                if not all_ocr_text:
+                    st.error("Could not extract text from any of the documents.")
+                    st.stop()
+
+                # 3. Create a combined summary
+                combined_text = "\n\n--- NEW DOCUMENT ---\n\n".join(all_ocr_text)
+                summary = generate_summary(combined_text)
+                
+                # 4. Embed and add summary vector
+                summary_embedding = vo.embed([summary], model="voyage-law-2", input_type="document").embeddings[0]
+                all_vectors.append({
+                    "id": "summary-0", "values": summary_embedding,
+                    "metadata": {"text": summary, "source": "Global Summary"}
+                })
+
+                # 5. Upsert all vectors to Pinecone
+                index.upsert(vectors=all_vectors)
+
+                # 6. Update session state
+                st.session_state.summary = summary
+                st.session_state.ocr_text = combined_text
+                st.session_state.doc_title = ", ".join(doc_titles)
+                
+                all_chunk_embeddings = [vec['values'] for vec in all_vectors if vec['id'] != 'summary-0']
+                st.session_state.chunk_embeddings = all_chunk_embeddings
+                st.session_state.chunks = all_chunks
+
+                # Reset state and rerun
+                reset_agent_state()
+                st.session_state.document_processed = True
+                st.session_state.messages = []
+                st.success(f"Processed {len(doc_titles)} documents. Ready for chat!")
+                st.rerun()
 
     st.divider()
 
     if not st.session_state.document_processed:
         st.info("Process a document to see available tools.")
     else:
-        st.header("2. Views")
-        
-        # Navigation
-        if st.session_state.view != "Chat":
-            if st.button("Switch to Chat View", use_container_width=True):
-                st.session_state.view = "Chat"
-                st.rerun()
-
+        st.header("Views")
         view_options = ["Chat", "Document Summary", "Knowledge Graph", "What-If Analysis", "Automation", "Negotiation Analysis"]
         
-        # Use a radio button for view selection, which feels more like navigation
         st.session_state.view = st.radio(
             "Select a View",
             view_options,
@@ -735,7 +752,7 @@ if not st.session_state.document_processed:
 else:
     # --- CHAT VIEW ---
     if st.session_state.view == "Chat":
-        st.header("Chat with the Document")
+        st.header('Chat')
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
@@ -850,7 +867,7 @@ else:
                     except Exception as exc:
                         st.error(f"Automation agent failed: {exc}")
         
-        st.subheader("n8n Shots")
+        st.subheader("Automated AI Workflows")
         st.caption("Send the latest automation JSON to reminders, messages, and voice in one shot.")
         if st.button("Trigger Reminders · Messages · Voice", use_container_width=True):
             with st.spinner("Triggering n8n workflow..."):
