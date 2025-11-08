@@ -1,0 +1,5 @@
+mistralai
+dotenv
+voyageai
+pinecone
+google.generativeai
