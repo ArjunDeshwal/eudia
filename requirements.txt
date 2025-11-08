@@ -3,3 +3,5 @@ dotenv
 voyageai
 pinecone
 google.generativeai
+streamlit
+langchain_text_splitters
